@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: adwaiteklavya
+      POSTGRES_PASSWORD: ""
+      POSTGRES_DB: queue_system
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adwaiteklavya"]
+      interval: 2s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.1
+    environment:
+      DATABASES_HOST: postgres
+      DATABASES_PORT: 5432
+      DATABASES_USER: adwaiteklavya
+      DATABASES_DBNAME: queue_system
+      PGBOUNCER_POOL_MODE: transaction
+      PGBOUNCER_MAX_CLIENT_CONN: 500
+      PGBOUNCER_DEFAULT_POOL_SIZE: 25
+      PGBOUNCER_AUTH_TYPE: trust
+    ports: ["6432:6432"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports: ["8474:8474", "5433:5433"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # create proxy: toxiproxy-cli create -l 0.0.0.0:5433 -u postgres:5432 queue
+    # then workers can use DATABASE_URL=postgresql://adwaiteklavya@toxiproxy:5433/queue_system to inject latency/drops
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # use pgbouncer in compose (5432 direct also works for local dev without compose)
+      DATABASE_URL: postgresql://adwaiteklavya@pgbouncer:6432/queue_system
+      LEASE_SECONDS: "8"
+      REAPER_INTERVAL_SECONDS: "2"
+      POLL_INTERVAL_SECONDS: "0.2"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    command: bash -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://adwaiteklavya@pgbouncer:6432/queue_system
+      LEASE_SECONDS: "8"
+      REAPER_INTERVAL_SECONDS: "2"
+      POLL_INTERVAL_SECONDS: "0.2"
+      WORKER_ID: "worker"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+    command: python -m app.worker.worker
+    deploy:
+      replicas: 1
+
+volumes:
+  pgdata:
